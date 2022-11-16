@@ -1,0 +1,389 @@
+---
+title: "Challenge 3 Starter"
+output: html_notebook
+---
+
+
+## Library
+
+```{r, message=FALSE, warning=FALSE}
+library(tidymodels)
+library(tidyverse)
+library(janitor)
+library(vip)
+library(skimr)
+library(xgboost)
+library(car)
+```
+
+
+## DATA
+
+```{r}
+boston <- read_csv("data/boston_train.csv") %>% clean_names() %>% mutate(zip = as.character(zip)) %>% mutate(yr_remod = replace_na(yr_remod,0)) %>% 
+mutate(log_av_total = log10(av_total))
+kaggle <- read_csv("data/boston_holdout.csv") %>% clean_names()
+zips   <- read_csv("data/zips.csv") %>% clean_names()
+
+boston %>% skim()
+```
+## Histogram Target
+
+```{r}
+
+options(scipen = 999)
+ggplot(boston, aes(x = av_total)) + 
+  geom_histogram(bins = 50, col= "white") +
+  labs(title=" Sale Price")
+
+ggplot(boston, aes(x = av_total)) + 
+  geom_histogram(bins = 50, col= "white") +
+  scale_x_log10() +
+  labs(title="Histogram Log of Sale Price")
+```
+
+## Partition our data 70/30 PLUS make K-Fold Cross Validation
+
+```{r}
+#set.seed(123)
+#70/30 split of the data
+bsplit <- initial_split(boston, prop = 0.75)
+train <- training(bsplit) 
+test  <-  testing(bsplit)
+
+# Kfold cross validation
+kfold_splits <- vfold_cv(train, v=5)
+
+```
+
+## Recipe 
+
+```{r}
+
+# recipe variables
+boston_recipe <-
+recipe(log_av_total ~  land_sf + living_area  + r_ovrall_cnd + median_income + r_ac   + r_heat_typ + yr_built +  r_fplace + r_ext_cnd + r_int_cnd +  r_bldg_styl  + r_roof_typ + r_ext_fin + r_total_rms + r_bdrms + r_full_bth + r_half_bth + r_bth_style + r_kitch_style + own_occ +  city_state + population + r_int_fin + pop_density 
+         , data = train) %>% 
+
+
+  step_mutate(age = 2022 - yr_built ) %>% 
+  step_rm(yr_built) %>%
+  step_impute_median(all_numeric_predictors()) %>% # missing values numeric 
+  step_novel(all_nominal_predictors()) %>% # new factor levels 
+  #step_unknown(all_nominal_predictors()) %>% # missing values 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+  #step_nzv(all_predictors(), freq_cut = 99.95/.05, unique_cut = 10) 
+
+#recipe results 
+bake(boston_recipe %>% prep(),train %>% sample_n(1000))
+
+```
+
+## Linear Reg Setup 
+Compare against
+```{r}
+lm_model <- linear_reg(mixture=1, penalty = 0.001) %>%
+  set_engine("glmnet") %>%
+  set_mode("regression") 
+
+
+lm_wflow <-workflow() %>%
+  add_recipe(boston_recipe) %>%
+  add_model(lm_model) %>%
+  fit(train)
+
+tidy(lm_wflow) %>%
+  mutate_if(is.numeric,round,4)
+
+lm_wflow %>%
+  pull_workflow_fit() %>%
+  tidy()%>%
+  mutate_if(is.numeric,round,4)
+
+lm_wflow %>%
+  pull_workflow_fit() %>%
+  vi() %>% 
+  mutate(Importance = if_else(Sign == "NEG", -Importance,Importance)) %>% 
+  ggplot(aes(reorder(Variable,Importance),Importance, fill=Sign)) +
+  geom_col() + coord_flip() + labs(title="linear model importance")
+  
+bind_cols(
+  predict(lm_wflow,train, type="numeric"), train) %>% 
+  mutate(part = "train") -> score_lm_train
+
+bind_cols(
+  predict(lm_wflow,test), test) %>% mutate(part = "test") -> score_lm_test
+
+bind_rows(score_lm_train, score_lm_test) %>% 
+  group_by(part) %>% 
+  mutate(.pred = 10^(.pred)) %>% 
+  metrics(av_total,(.pred) )%>%
+  pivot_wider(id_cols = part, names_from = .metric, values_from = .estimate)
+
+```
+```{r Kaggle_LM, eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+bind_cols(predict(lm_wflow,kaggle),kaggle) %>%
+  select(pid,av_total = .pred) %>%  write_csv("challenge_3_(lm4)fishbaugh_06649380.csv")
+```
+
+## XGBoost Model Buiding
+Here we want to TUNE our XGB model using the Bayes method. 
+
+```{r}
+
+xgb_model <- boost_tree(trees = tune(), 
+                        learn_rate = tune(),
+                        tree_depth = tune()
+                        #min_n = tune(),
+                        #sample_size = tune(),
+                        #loss_reduction = tune()
+                        ) %>%
+  set_engine("xgboost",
+             importance="permutation") %>%
+  set_mode("regression")
+
+
+xgb_wflow <-workflow() %>%
+  add_recipe(boston_recipe) %>%
+  add_model(xgb_model)
+
+xgb_search_res <- xgb_wflow %>% 
+  tune_bayes(
+    resamples = kfold_splits,
+    # Generate five at semi-random to start
+    initial = 5,
+    iter = 5, 
+    # How to measure performance?
+    metrics = metric_set(rmse, rsq),
+    control = control_bayes( no_improve = 5, verbose = TRUE)
+  )
+```
+
+
+## XGB Tuning 
+Evaluate the tuning efforts 
+
+```{r}
+# Experiments 
+xgb_search_res %>%
+  collect_metrics()  %>% 
+  filter(.metric == "rmse")
+
+# Graph of learning rate 
+xgb_search_res %>%
+  collect_metrics() %>%
+  ggplot(aes(learn_rate, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+
+# graph of tree depth 
+xgb_search_res %>%
+  collect_metrics() %>%
+  ggplot(aes(tree_depth, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+
+# graph of number of trees 
+xgb_search_res %>%
+  collect_metrics() %>%
+  ggplot(aes(trees, mean, color = .metric)) +
+  geom_errorbar(aes(
+    ymin = mean - std_err,
+    ymax = mean + std_err
+  ),
+  alpha = 0.5
+  ) +
+  geom_line(size = 1.5) +
+  facet_wrap(~.metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+```
+
+## Final Fit  XGB
+
+Finally fit the XGB model using the best set of parameters 
+
+```{r}
+
+
+lowest_xgb_rmse <- xgb_search_res %>%
+  select_best("rmse")
+
+lowest_xgb_rmse
+
+xgb_wflow <- finalize_workflow(
+  xgb_wflow, lowest_xgb_rmse
+) %>% 
+  fit(train) 
+
+```
+
+## VIP 
+What variables are important 
+```{r}
+xgb_wflow %>%
+  extract_fit_parsnip() %>%
+  vi()
+
+```
+
+## Evaluate the XGBoost BEST Model 
+
+```{r}
+xgb_train_predict <- bind_cols(
+  predict(xgb_wflow,train), train) %>% 
+  mutate(.pred = 10^(.pred)) %>% 
+  metrics(av_total,.pred)
+xgb_train_predict
+xgb_test_predict <- bind_cols(
+  predict(xgb_wflow,test), test) %>% 
+   mutate(.pred = 10^(.pred)) %>% 
+  metrics(av_total,.pred)
+xgb_test_predict
+```
+
+
+## Best Worst Predicitons: Top 10
+
+```{r}
+# best estimate 
+bind_cols(predict(xgb_wflow,test),test) %>%
+  mutate(.pred = 10^.pred) %>% 
+  mutate(model_difference = av_total - .pred,
+         abs_model_difference = abs(model_difference)) %>% 
+  slice_min(order_by = abs_model_difference,n=10) -> best_estimate 
+top_10 <- best_estimate %>% select(pid, city_state, .pred, av_total, model_difference) %>% 
+slice_min (order_by = model_difference, n = 10)
+top_10
+
+best_estimate %>% 
+ summarize(
+    mean(model_difference),
+    mean(av_total),
+            mean(yr_built))
+# worst over-estimate 
+bind_cols(predict(xgb_wflow,test),test)%>%
+  mutate (.pred = 10^.pred) %>%
+  mutate(model_difference = av_total - .pred,
+         abs_model_difference = abs(model_difference)) %>% 
+  slice_min(order_by = model_difference,n=10) -> over_estimate
+
+bottom_10 <- over_estimate %>%  select(pid, city_state, .pred, av_total, model_difference) %>% 
+slice_min (order_by = model_difference, n = 10)
+bottom_10
+# overly simplistic evaluation 
+over_estimate %>% 
+  summarize(
+    mean(model_difference),
+    mean(av_total),
+            mean(yr_built))
+```
+
+## KAGGLE 
+
+```{r}
+bind_cols(predict(xgb_wflow,kaggle),kaggle) %>%
+  mutate(.pred = 10^.pred) %>% 
+  select(pid,av_total = .pred) %>%  write_csv("challenge_3_(xg13)fishbaugh_06649380.csv")
+``` 
+
+###RANDOM FOREST
+```{r}
+boston_recipe1 <-
+recipe(av_total ~  land_sf + living_area  + r_ovrall_cnd + median_income + r_ac   + r_heat_typ + yr_built +  r_fplace + r_ext_cnd + r_int_cnd +  r_bldg_styl  + r_roof_typ + r_ext_fin + r_total_rms + r_bdrms + r_full_bth + r_half_bth + r_bth_style + r_kitch_style + own_occ +  city_state + population + r_int_fin + pop_density 
+         , data = train) %>% 
+
+
+  step_mutate(age = 2022 - yr_built ) %>% 
+  step_rm(yr_built) %>%
+  step_impute_median(all_numeric_predictors()) %>% # missing values numeric 
+  step_novel(all_nominal_predictors()) %>% # new factor levels 
+  #step_unknown(all_nominal_predictors()) %>% # missing values 
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) 
+  #step_nzv(all_predictors(), freq_cut = 99.95/.05, unique_cut = 10) 
+rf_model <- rand_forest(
+  trees = tune(),
+  min_n = tune()) %>% 
+  set_engine("ranger",
+             importance = "permutation") %>% 
+  set_mode("regression") 
+
+##define workflows
+rf_workflow <- workflow() %>% 
+  add_recipe(boston_recipe1) %>% 
+  add_model(rf_model)
+```
+
+##DFINE TUNE GRID
+```{r}
+rf_tune_grid <- grid_regular(trees(c(200, 400)),
+                             min_n(),
+                             levels = 2)
+print(rf_tune_grid)
+
+##TUNE RESULTS
+rf_tuning_results <- rf_workflow %>% 
+  tune_grid(
+    resamples = kfold_splits,
+    grid = rf_tune_grid,
+  )
+```
+
+##BEST RESULTS
+```{r}
+rf_tuning_results %>% 
+  collect_metrics() %>% 
+  mutate_if(is.numeric, round, 3) %>% 
+  pivot_wider(names_from = .metric, values_from = c(mean, std_err)) 
+
+rf_best_rmse <- rf_tuning_results %>% 
+  select_best("rmse")
+
+rf_final_wf <- rf_workflow %>% 
+  finalize_workflow(rf_best_rmse)
+
+rf_final_fit <- rf_final_wf %>% 
+  fit(data = train)
+```
+
+##EVAL RESULTS
+```{r}
+regression_eval <- function(model) {
+#score train
+  predict(model, train) %>% 
+    bind_cols(., train) -> train_scored
+
+    ##SCORE TEST  
+  predict(model, test, type= "numeric") %>% 
+    bind_cols(.,test) -> test_scored
+##METRICS
+  train_scored %>% 
+    mutate(part = "train") %>% 
+    bind_rows(test_scored %>% mutate(part= "test")) %>% 
+    group_by(part) %>% 
+    metrics(av_total, estimate = .pred) %>% 
+    filter(.metric %in% c('rmse', 'rsq')) %>% 
+    pivot_wider(names_from = .metric, values_from = .estimate) %>% 
+    print()
+}
+
+#regression_eval(xgb_wkflow)
+regression_eval (rf_final_fit)
+```
+
